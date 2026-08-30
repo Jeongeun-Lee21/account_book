@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 
 type Expense = {
@@ -11,25 +11,76 @@ type Expense = {
   created_at?: string;
 };
 
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+};
+
+const WELCOME_MESSAGE =
+  "안녕하세요! AI 가계부 챗봇입니다.\n\n지출 기록: 오늘 점심 12000원\n통계 질문: 이번 달 총 지출이 얼마야?";
+
+const CHAT_STORAGE_KEY = "ai-account-book-chat";
+
+function createWelcomeMessage(): ChatMessage {
+  return { id: createId(), role: "assistant", content: WELCOME_MESSAGE };
+}
+
+function loadStoredMessages(): ChatMessage[] {
+  try {
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    if (!raw) return [createWelcomeMessage()];
+
+    const saved = JSON.parse(raw) as ChatMessage[];
+    if (!Array.isArray(saved) || saved.length === 0) return [createWelcomeMessage()];
+
+    return saved.filter(
+      (item) =>
+        (item.role === "user" || item.role === "assistant") &&
+        typeof item.content === "string" &&
+        item.content.trim(),
+    );
+  } catch {
+    return [createWelcomeMessage()];
+  }
+}
+
 function formatAmount(value: number) {
   return new Intl.NumberFormat("ko-KR").format(value);
 }
 
-function todayString() {
-  return new Date().toISOString().slice(0, 10);
+function createId() {
+  return crypto.randomUUID();
 }
 
-const fieldClassName =
-  "h-14 w-full rounded-xl bg-background px-4 text-base text-foreground outline-none transition placeholder:text-muted/80 focus:ring-2 focus:ring-foreground/10 sm:h-12 sm:text-[15px]";
-
 export default function Home() {
-  const [date, setDate] = useState(todayString);
-  const [amount, setAmount] = useState("");
-  const [description, setDescription] = useState("");
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([createWelcomeMessage()]);
+  const [chatReady, setChatReady] = useState(false);
+  const [input, setInput] = useState("");
   const [ready, setReady] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  }, []);
+
+  const isNearBottom = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+  }, []);
+
+  const handleChatScroll = useCallback(() => {
+    shouldAutoScrollRef.current = isNearBottom();
+  }, [isNearBottom]);
 
   const loadExpenses = useCallback(async () => {
     const { data, error: fetchError } = await supabase
@@ -52,191 +103,213 @@ export default function Home() {
     void loadExpenses();
   }, [loadExpenses]);
 
+  useEffect(() => {
+    setMessages(loadStoredMessages());
+    setChatReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!chatReady) return;
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages));
+  }, [messages, chatReady]);
+
+  useEffect(() => {
+    if (!shouldAutoScrollRef.current) return;
+    scrollToBottom(messages.length <= 2 ? "auto" : "smooth");
+  }, [messages, sending, scrollToBottom]);
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    const parsedAmount = Number(amount.replace(/,/g, ""));
-    if (!date || !description.trim() || !Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      return;
-    }
+    const trimmed = input.trim();
+    if (!trimmed || sending) return;
 
-    setSaving(true);
+    const userMessage: ChatMessage = {
+      id: createId(),
+      role: "user",
+      content: trimmed,
+    };
+
+    const history = messages
+      .slice(1)
+      .map(({ role, content }) => ({ role, content }));
+
+    setMessages((prev) => [...prev, userMessage]);
+    setInput("");
+    setSending(true);
     setError(null);
+    shouldAutoScrollRef.current = true;
 
-    const { error: insertError } = await supabase.from("expenses").insert({
-      date,
-      amount: parsedAmount,
-      description: description.trim(),
-    });
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: trimmed,
+          history,
+          expenses: expenses.map(({ date, amount, description }) => ({
+            date,
+            amount,
+            description,
+          })),
+        }),
+      });
 
-    setSaving(false);
+      const data = (await response.json()) as {
+        reply?: string;
+        saved?: boolean;
+        expense?: Expense | null;
+        error?: string;
+      };
 
-    if (insertError) {
-      setError(insertError.message);
-      return;
+      if (!response.ok) {
+        setError(data.error || "요청 처리에 실패했습니다.");
+      }
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: createId(),
+          role: "assistant",
+          content:
+            data.reply ||
+            (response.ok ? "알겠습니다." : "죄송합니다. 다시 시도해 주세요."),
+        },
+      ]);
+
+      if (data.saved && data.expense) {
+        setExpenses((prev) => [data.expense as Expense, ...prev]);
+        void loadExpenses();
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "메시지 전송에 실패했습니다.";
+      setError(message);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: createId(),
+          role: "assistant",
+          content: "네트워크 오류가 발생했어요. 연결을 확인하고 다시 시도해 주세요.",
+        },
+      ]);
+    } finally {
+      setSending(false);
+      inputRef.current?.focus();
     }
-
-    setAmount("");
-    setDescription("");
-    setDate(todayString());
-    await loadExpenses();
-  }
-
-  async function handleDelete(id: string) {
-    setError(null);
-    const { error: deleteError } = await supabase.from("expenses").delete().eq("id", id);
-
-    if (deleteError) {
-      setError(deleteError.message);
-      return;
-    }
-
-    setExpenses((prev) => prev.filter((item) => item.id !== id));
   }
 
   const total = expenses.reduce((sum, item) => sum + item.amount, 0);
 
   return (
-    <div className="flex min-h-full flex-1 flex-col bg-background">
-      <main className="mx-auto flex w-full max-w-xl flex-1 flex-col px-5 py-12 sm:px-8 sm:py-20">
-        <header className="mb-12 sm:mb-16">
-          <h1 className="text-[2rem] font-semibold tracking-tight text-foreground sm:text-4xl">
-            나의 스마트 가계부
-          </h1>
-          <p className="mt-3 text-base leading-relaxed text-muted sm:text-[17px]">
-            지출을 기록하고 한눈에 살펴보세요
-          </p>
-        </header>
+    <div className="flex h-dvh flex-col bg-background">
+      <header className="shrink-0 border-b border-black/[0.06] bg-background px-4 py-4 sm:px-6">
+        <h1 className="text-center text-lg font-semibold tracking-tight text-foreground sm:text-xl">
+          AI 가계부 챗봇
+        </h1>
+      </header>
 
-        <form
-          onSubmit={handleSubmit}
-          className="w-full rounded-2xl bg-surface p-6 sm:p-8"
+      <section className="shrink-0 border-b border-black/[0.06] bg-surface/50 px-4 py-4 sm:px-6">
+        <div className="mb-3 flex items-baseline justify-between gap-3">
+          <h2 className="text-sm font-medium text-foreground">저장된 지출</h2>
+          {expenses.length > 0 && (
+            <p className="font-mono text-sm tabular-nums text-muted">
+              합계 {formatAmount(total)}원
+            </p>
+          )}
+        </div>
+
+        {!ready ? (
+          <p className="py-2 text-sm text-muted">불러오는 중…</p>
+        ) : expenses.length === 0 ? (
+          <p className="py-2 text-sm text-muted">아직 저장된 지출이 없습니다</p>
+        ) : (
+          <ul className="flex gap-3 overflow-x-auto pb-1 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {expenses.map((item) => (
+              <li
+                key={item.id}
+                className="min-w-[168px] shrink-0 rounded-2xl bg-background px-4 py-3"
+              >
+                <p className="truncate text-[15px] font-medium text-foreground">
+                  {item.description}
+                </p>
+                <p className="mt-1 font-mono text-lg font-medium tabular-nums text-foreground">
+                  {formatAmount(item.amount)}
+                  <span className="ml-0.5 text-xs font-sans font-normal text-muted">
+                    원
+                  </span>
+                </p>
+                <p className="mt-1 text-xs text-muted">{item.date}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div
+          ref={chatScrollRef}
+          onScroll={handleChatScroll}
+          className="chat-scroll min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 py-5 sm:px-6"
         >
-          <div className="flex flex-col gap-8 sm:gap-7">
-            <label className="flex flex-col gap-2.5">
-              <span className="text-[15px] font-medium text-foreground sm:text-sm">
-                날짜
-              </span>
-              <input
-                type="date"
-                value={date}
-                onChange={(e) => setDate(e.target.value)}
-                required
-                className={fieldClassName}
-              />
-            </label>
-
-            <label className="flex flex-col gap-2.5">
-              <span className="text-[15px] font-medium text-foreground sm:text-sm">
-                금액
-              </span>
-              <div className="relative">
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  min="1"
-                  step="1"
-                  placeholder="0"
-                  value={amount}
-                  onChange={(e) => setAmount(e.target.value)}
-                  required
-                  className={`${fieldClassName} pr-12 font-mono tabular-nums`}
-                />
-                <span className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-[15px] text-muted">
-                  원
-                </span>
+          <div className="mx-auto flex min-h-full max-w-2xl flex-col gap-3 pb-2">
+            {messages.map((message) => (
+              <div
+                key={message.id}
+                className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+              >
+                <div
+                  className={`max-w-[82%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-[15px] leading-relaxed sm:max-w-[75%] sm:text-base ${
+                    message.role === "user"
+                      ? "rounded-br-md bg-accent text-white"
+                      : "rounded-bl-md bg-surface text-foreground"
+                  }`}
+                >
+                  {message.content}
+                </div>
               </div>
-            </label>
+            ))}
 
-            <label className="flex flex-col gap-2.5">
-              <span className="text-[15px] font-medium text-foreground sm:text-sm">
-                내용
-              </span>
-              <input
-                type="text"
-                placeholder="예: 점심 식사, 교통비"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                required
-                maxLength={80}
-                className={fieldClassName}
-              />
-            </label>
-
-            <button
-              type="submit"
-              disabled={saving}
-              className="mt-1 min-h-14 w-full rounded-xl bg-accent text-[17px] font-medium text-white transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40 sm:min-h-12 sm:text-[15px]"
-            >
-              {saving ? "저장 중…" : "저장하기"}
-            </button>
+            {sending && (
+              <div className="flex justify-start">
+                <div className="rounded-2xl rounded-bl-md bg-surface px-4 py-3 text-[15px] text-muted">
+                  입력 중…
+                </div>
+              </div>
+            )}
           </div>
-        </form>
+        </div>
 
         {error && (
-          <p className="mt-6 text-[15px] leading-relaxed text-muted">
+          <p className="shrink-0 px-4 pb-2 text-center text-sm text-muted sm:px-6">
             {error}
           </p>
         )}
 
-        <section className="mt-14 flex w-full flex-1 flex-col sm:mt-16">
-          <div className="mb-6 flex items-baseline justify-between gap-4 sm:mb-8">
-            <h2 className="text-lg font-semibold tracking-tight text-foreground sm:text-xl">
-              지출 내역
-            </h2>
-            {expenses.length > 0 && (
-              <p className="font-mono text-xl font-medium tabular-nums tracking-tight text-foreground sm:text-2xl">
-                {formatAmount(total)}
-                <span className="ml-0.5 text-base font-sans font-normal text-muted sm:text-lg">
-                  원
-                </span>
-              </p>
-            )}
+        <form
+          onSubmit={handleSubmit}
+          className="shrink-0 border-t border-black/[0.06] bg-background px-4 py-3 sm:px-6 sm:py-4"
+        >
+          <div className="mx-auto flex max-w-2xl items-end gap-2 sm:gap-3">
+            <input
+              ref={inputRef}
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="지출 내용을 입력하세요"
+              disabled={sending}
+              className="min-h-12 flex-1 rounded-2xl bg-surface px-4 text-base text-foreground outline-none transition placeholder:text-muted/80 focus:ring-2 focus:ring-foreground/10 disabled:opacity-60"
+            />
+            <button
+              type="submit"
+              disabled={sending || !input.trim()}
+              className="min-h-12 shrink-0 rounded-2xl bg-accent px-5 text-[15px] font-medium text-white transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40 sm:px-6"
+            >
+              전송
+            </button>
           </div>
-
-          {!ready ? (
-            <p className="py-12 text-center text-[15px] text-muted">
-              불러오는 중…
-            </p>
-          ) : expenses.length === 0 ? (
-            <p className="py-12 text-center text-[15px] text-muted">
-              아직 저장된 지출이 없습니다
-            </p>
-          ) : (
-            <ul className="flex flex-col gap-3">
-              {expenses.map((item) => (
-                <li
-                  key={item.id}
-                  className="flex items-center justify-between gap-4 rounded-2xl bg-surface px-5 py-5 sm:px-6 sm:py-5"
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-[17px] font-medium leading-snug text-foreground sm:text-base">
-                      {item.description}
-                    </p>
-                    <p className="mt-1.5 text-sm text-muted">{item.date}</p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-3 sm:gap-4">
-                    <span className="font-mono text-xl font-medium tabular-nums tracking-tight text-foreground sm:text-[1.35rem]">
-                      {formatAmount(item.amount)}
-                      <span className="ml-0.5 text-sm font-sans font-normal text-muted">
-                        원
-                      </span>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void handleDelete(item.id)}
-                      className="min-h-11 min-w-11 rounded-lg text-sm text-muted transition-colors hover:text-foreground sm:min-h-0 sm:min-w-0"
-                      aria-label={`${item.description} 삭제`}
-                    >
-                      삭제
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      </main>
+        </form>
+      </div>
     </div>
   );
 }

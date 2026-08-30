@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "나의 스마트 가계부",
-  description: "간단하고 깔끔한 지출 기록 가계부",
+  title: "AI 가계부 챗봇",
+  description: "AI와 대화하며 지출을 기록하는 스마트 가계부",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

@@ -27,15 +27,12 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-input[type="date"],
-input[type="number"],
 input[type="text"] {
   appearance: none;
   -webkit-appearance: none;
 }
 
-input[type="number"]::-webkit-inner-spin-button,
-input[type="number"]::-webkit-outer-spin-button {
-  -webkit-appearance: none;
-  margin: 0;
+.chat-scroll {
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
 }
